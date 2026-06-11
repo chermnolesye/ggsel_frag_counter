@@ -16,112 +16,194 @@ TG_TOKEN = "8984090136:AAFjLjrT0iLoBBMCv2RLJlbtXs8Wdu5RJIA"
 TG_URL   = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
 # HDE id -> (имя, telegram chat_id, час начала смены, час конца смены)
-# chat_id = None пока оператор не написал боту
 OPERATORS = {
     # --- 08:00 - 16:00 ---
-    153: ("Андрей",    None,      8, 16),
-    301: ("Иван К",    None,      8, 16),
-    535: ("Дмитрий",  None,      8, 16),
-    100: ("Мария",     None,      8, 16),
+    153: ("Андрей",     None,      8, 16),
+    301: ("Иван К",     None,      8, 16),
+    535: ("Дмитрий",    None,      8, 16),
+    100: ("Мария",      None,      8, 16),
     # --- 14:00 - 22:00 ---
-    536: ("Данила",    None,     14, 22),
-    200: ("Диана",     None,     14, 22),
-    62:  ("Игорь",     None,     14, 22),
-    537: ("Виктор",   None,     14, 22),
-    343: ("Роман",     None,     14, 22),
-    538: ("Ксения",    None,     14, 22),
+    536: ("Данила",     None,     14, 22),
+    200: ("Диана",      None,     14, 22),
+    62:  ("Игорь",      None,     14, 22),
+    537: ("Виктор",     None,     14, 22),
+    343: ("Роман",      None,     14, 22),
+    538: ("Ксения",     None,     14, 22),
     # --- 18:00 - 02:00 ---
-    258: ("Максим",    None,     18,  2),
-    391: ("Влада",     None,     18,  2),
+    258: ("Максим",     None,     18,  2),
+    391: ("Влада",      None,     18,  2),
     369: ("Александра", 907994201, 18, 2),  # тест
     # --- 02:00 - 10:00 ---
-    539: ("Иван С",    None,      2, 10),
-    540: ("Иван М",    None,      2, 10),
+    539: ("Иван С",     None,      2, 10),
+    540: ("Иван М",     None,      2, 10),
 }
 # ============================================================
 
-def shift_window(shift_start_h: int, shift_end_h: int) -> tuple[datetime, datetime]:
-    """Возвращает (начало, конец) смены. Конец = сейчас, начало = конец - длительность."""
+ANSWER_EVENTS = {"ticket_answer", "ticket_answer_chat"}
+
+def shift_window(sh_start: int, sh_end: int) -> tuple[datetime, datetime]:
     now = datetime.now()
-    duration = shift_end_h - shift_start_h
+    duration = sh_end - sh_start
     if duration <= 0:
-        duration += 24  # ночная смена (18→02 = 8ч, 02→10 = 8ч)
+        duration += 24
     return now - timedelta(hours=duration), now
+
+def parse_hde_dt(s: str) -> datetime | None:
+    """Парсит дату HDE в формате 'HH:MM:SS DD.MM.YYYY'."""
+    try:
+        return datetime.strptime(s, "%H:%M:%S %d.%m.%Y")
+    except Exception:
+        return None
+
+async def get_ticket_ids(client: httpx.AsyncClient, operator_id: int,
+                         start: datetime, end: datetime) -> list[int]:
+    """Берёт все закрытые заявки оператора за период (по date_updated)."""
+    fmt = "%Y-%m-%d %H:%M:%S"
+    ids = []
+    page = 1
+    while True:
+        r = await client.get(f"{HDE_BASE}/tickets", params={
+            "owner_list":        operator_id,
+            "status_list":       "closed",
+            "from_date_updated": start.strftime(fmt),
+            "to_date_updated":   end.strftime(fmt),
+            "per_page":          100,
+            "page":              page,
+        })
+        if r.status_code != 200:
+            log.error(f"tickets {r.status_code}: {r.text[:100]}")
+            break
+        data = r.json()
+        tickets = data.get("data", {})
+        if isinstance(tickets, dict):
+            tickets = list(tickets.values())
+        ids.extend(t["id"] for t in tickets)
+        pag = data.get("pagination", {})
+        if page >= pag.get("total_pages", 1):
+            break
+        page += 1
+    return ids
+
+async def check_ticket(client: httpx.AsyncClient, ticket_id: int,
+                       operator_id: int, start: datetime, end: datetime) -> dict | None:
+    """
+    Проверяет по аудиту:
+    1. Оператор сам назначил себя исполнителем в период смены
+    2. Оператор сам ответил хотя бы раз
+    3. Оператор сам закрыл заявку в период смены
+    Возвращает время первого ответа оператора (для расчёта SLA) или None если не подходит.
+    """
+    r = await client.get(f"{HDE_BASE}/tickets/{ticket_id}/audit")
+    if r.status_code != 200:
+        return None
+
+    events = list(r.json().get("data", {}).values())
+    # Сортируем по времени (аудит идёт от новых к старым)
+    events.sort(key=lambda e: parse_hde_dt(e["date_created"]) or datetime.min)
+
+    op_assigned_at     = None   # когда оператор назначил себя
+    op_answered        = False  # оператор ответил хотя бы раз
+    op_closed          = False  # оператор закрыл
+    first_op_answer_at = None
+
+    for e in events:
+        dt = parse_hde_dt(e["date_created"])
+        uid = e.get("user_id")
+        evt = e.get("event")
+
+        # Проверяем только события в период смены
+        if dt and not (start <= dt <= end):
+            continue
+
+        if evt == "owner_update" and uid == operator_id:
+            # Оператор назначил себя — запоминаем момент
+            op_assigned_at = dt
+
+        if evt in ANSWER_EVENTS and uid == operator_id:
+            op_answered = True
+            if first_op_answer_at is None:
+                first_op_answer_at = dt
+
+        if evt == "ticket_close" and uid == operator_id:
+            op_closed = True
+
+    if not (op_assigned_at and op_answered and op_closed):
+        return None
+
+    # Время от назначения себя исполнителем до первого ответа
+    response_seconds = None
+    if op_assigned_at and first_op_answer_at:
+        diff = (first_op_answer_at - op_assigned_at).total_seconds()
+        if diff >= 0:
+            response_seconds = diff
+
+    return {"response_seconds": response_seconds}
 
 
 async def get_stats(operator_id: int, start: datetime, end: datetime) -> dict:
-    """Считает закрытые заявки оператора за период."""
-    fmt = "%Y-%m-%d %H:%M:%S"
-    closed = 0
-    total_rate = 0
-    rate_count = 0
-    page = 1
-
+    """Полная статистика оператора за смену через аудит."""
     async with httpx.AsyncClient(auth=HDE_AUTH, timeout=30) as client:
-        while True:
-            params = {
-                "owner_list":        operator_id,
-                "status_list":       "closed",
-                "from_date_updated": start.strftime(fmt),
-                "to_date_updated":   end.strftime(fmt),
-                "per_page":          100,
-                "page":              page,
-            }
-            r = await client.get(f"{HDE_BASE}/tickets", params=params)
+        ticket_ids = await get_ticket_ids(client, operator_id, start, end)
+        log.info(f"  Найдено кандидатов: {len(ticket_ids)}")
 
-            if r.status_code != 200:
-                log.error(f"HDE вернул {r.status_code}: {r.text[:200]}")
-                break
+        # Проверяем аудит параллельно, пачками по 10
+        results = []
+        for i in range(0, len(ticket_ids), 10):
+            batch = ticket_ids[i:i+10]
+            batch_results = await asyncio.gather(*[
+                check_ticket(client, tid, operator_id, start, end)
+                for tid in batch
+            ])
+            results.extend(batch_results)
 
-            data = r.json()
-            tickets = data.get("data", {})
-            if isinstance(tickets, dict):
-                tickets = list(tickets.values())
+    valid = [r for r in results if r is not None]
+    closed = len(valid)
 
-            for t in tickets:
-                closed += 1
-                rate = t.get("rate")
-                if rate and str(rate).isdigit():
-                    total_rate += int(rate)
-                    rate_count += 1
+    # Среднее время первого ответа
+    times = [r["response_seconds"] for r in valid if r["response_seconds"] is not None]
+    avg_response = round(sum(times) / len(times)) if times else None
 
-            pagination = data.get("pagination", {})
-            if page >= pagination.get("total_pages", 1):
-                break
-            page += 1
+    return {"closed": closed, "avg_response_seconds": avg_response}
 
-    avg_rate = round(total_rate / rate_count, 1) if rate_count else None
-    return {"closed": closed, "avg_rate": avg_rate, "rate_count": rate_count}
+
+def format_time(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds} сек"
+    elif seconds < 3600:
+        return f"{seconds // 60} мин"
+    else:
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        return f"{h}ч {m}мин" if m else f"{h}ч"
 
 
 async def send_report(operator_id: int, name: str, chat_id: int,
-                      shift_start_h: int, shift_end_h: int):
+                      sh_start: int, sh_end: int):
     if chat_id is None:
         log.info(f"{name}: chat_id не задан, пропускаем")
         return
 
-    start, end = shift_window(shift_start_h, shift_end_h)
-    log.info(f"Статистика для {name}: {start.strftime('%H:%M')} — {end.strftime('%H:%M')}")
+    start, end = shift_window(sh_start, sh_end)
+    log.info(f"Считаем статистику для {name}: {start.strftime('%H:%M')} — {end.strftime('%H:%M')}")
 
     stats = await get_stats(operator_id, start, end)
 
-    if stats["avg_rate"] is not None:
-        rate_str = f"⭐ Средняя оценка: {stats['avg_rate']} ({stats['rate_count']} шт.)"
-    else:
-        rate_str = "⭐ Оценок за смену нет"
+    if stats["closed"] == 0:
+        log.info(f"{name}: 0 заявок, не отправляем")
+        return
 
-    end_h = f"{shift_end_h:02d}:00"
-    start_h = f"{shift_start_h:02d}:00"
+    avg_r = stats["avg_response_seconds"]
+    response_str = f"⚡ Среднее время ответа: {format_time(avg_r)}" if avg_r else "⚡ Нет данных о времени ответа"
 
     text = (
         f"🎮 <b>FragCounter — итоги смены</b>\n"
         f"━━━━━━━━━━━━━━━\n"
         f"👤 {name}\n"
-        f"🕐 Смена: {start_h} — {end_h}\n"
+        f"🕐 Смена: {sh_start:02d}:00 — {sh_end:02d}:00\n"
         f"📅 {end.strftime('%d.%m.%Y')}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"✅ Закрыто заявок: <b>{stats['closed']}</b>\n"
-        f"{rate_str}\n"
+        f"{response_str}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"GG WP! 🏆"
     )
@@ -139,36 +221,28 @@ async def send_report(operator_id: int, name: str, chat_id: int,
 
 
 async def run_shift(end_hour: int):
-    """Запускает отправку для всех операторов с данным концом смены."""
-    tasks = []
-    for op_id, (name, chat_id, sh_start, sh_end) in OPERATORS.items():
-        if sh_end == end_hour:
-            tasks.append(send_report(op_id, name, chat_id, sh_start, sh_end))
+    tasks = [
+        send_report(op_id, name, chat_id, sh_start, sh_end)
+        for op_id, (name, chat_id, sh_start, sh_end) in OPERATORS.items()
+        if sh_end == end_hour
+    ]
     await asyncio.gather(*tasks)
 
 
 async def main():
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
-    # Собираем уникальные часы конца смены
     end_hours = set(sh_end for _, (_, _, _, sh_end) in OPERATORS.items())
-
     for end_hour in end_hours:
         names = [n for _, (n, _, _, se) in OPERATORS.items() if se == end_hour]
-        scheduler.add_job(
-            run_shift,
-            trigger="cron",
-            hour=end_hour % 24,
-            minute=0,
-            args=[end_hour],
-            id=f"shift_{end_hour}",
-        )
+        scheduler.add_job(run_shift, "cron", hour=end_hour % 24, minute=0,
+                          args=[end_hour], id=f"shift_{end_hour}")
         log.info(f"Задача в {end_hour:02d}:00 → {names}")
 
     scheduler.start()
     log.info("Планировщик запущен")
 
-    # Тестовый запуск прямо сейчас (только операторы с chat_id)
+    # Тестовый запуск
     log.info("=== ТЕСТОВЫЙ ЗАПУСК ===")
     for op_id, (name, chat_id, sh_start, sh_end) in OPERATORS.items():
         if chat_id is not None:
@@ -176,7 +250,6 @@ async def main():
 
     while True:
         await asyncio.sleep(60)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
