@@ -7,9 +7,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
-# ============================================================
-# НАСТРОЙКИ
-# ============================================================
 HDE_BASE = "https://ggsel.helpdeskeddy.com/api/v2"
 HDE_AUTH = ("jivo@ggsel.net", "26fc4db0-8683-4fe6-92b0-6e2daaae8a5c")
 TG_TOKEN = "8984090136:AAFjLjrT0iLoBBMCv2RLJlbtXs8Wdu5RJIA"
@@ -21,7 +18,7 @@ OPERATORS = {
     153: ("Андрей",     None,       8, 16),
     301: ("Иван К",     None,       8, 16),
     535: ("Дмитрий",    None,       8, 16),
-    100: ("Мария",      None,       8, 16),
+    100: ("Мария",      456062447,       8, 16),
     # --- 14:00 - 22:00 ---
     536: ("Данила",     None,      14, 22),
     200: ("Диана",      None,      14, 22),
@@ -37,17 +34,10 @@ OPERATORS = {
     539: ("Иван С",     None,       2, 10),
     540: ("Иван М",     None,       2, 10),
 }
-# ============================================================
 
 ANSWER_EVENTS = {"ticket_answer", "ticket_answer_chat"}
 
-SOURCE_LABELS = {
-    "chat":  "💬 Чат",
-    "email": "📧 Email",
-    "tlgrm": "✈️ Telegram",
-    "vk":    "🔵 ВКонтакте",
-    "api":   "⚙️ API",
-}
+
 
 def shift_window(sh_start: int, sh_end: int) -> tuple[datetime, datetime]:
     now = datetime.now()
@@ -157,7 +147,6 @@ async def check_ticket(client: httpx.AsyncClient, ticket: dict,
 
     return {
         "ticket_id":        ticket_id,
-        "source":           ticket.get("source", ""),
         "response_seconds": response_seconds,
         "rate":             rate_val,
     }
@@ -168,7 +157,6 @@ async def get_stats(operator_id: int, start: datetime, end: datetime) -> dict:
         candidates = await get_ticket_candidates(client, operator_id, start, end)
         log.info(f"  Кандидатов: {len(candidates)}")
 
-        # Проверяем аудит пачками по 10
         results = []
         for i in range(0, len(candidates), 10):
             batch = candidates[i:i+10]
@@ -178,7 +166,6 @@ async def get_stats(operator_id: int, start: datetime, end: datetime) -> dict:
             ])
             results.extend(batch_res)
 
-    # Дедупликация по ticket_id (заявка считается один раз за смену)
     seen = set()
     valid = []
     for r in results:
@@ -200,18 +187,11 @@ async def get_stats(operator_id: int, start: datetime, end: datetime) -> dict:
     avg_rate  = round(sum(rates) / len(rates), 1) if rates else None
     rate_count = len(rates)
 
-    # Разбивка по источникам
-    sources: dict[str, int] = {}
-    for r in valid:
-        src = r["source"]
-        sources[src] = sources.get(src, 0) + 1
-
     return {
         "closed":       closed,
         "avg_response": avg_response,
         "avg_rate":     avg_rate,
         "rate_count":   rate_count,
-        "sources":      sources,
     }
 
 
@@ -240,15 +220,6 @@ async def send_report(operator_id: int, name: str, chat_id: int,
     else:
         rate_str = "⭐ Оценок за смену нет"
 
-    # Источники
-    sources_str = ""
-    if stats["sources"]:
-        parts = []
-        for src, cnt in sorted(stats["sources"].items(), key=lambda x: -x[1]):
-            label = SOURCE_LABELS.get(src, src)
-            parts.append(f"  {label}: {cnt}")
-        sources_str = "\n📊 По источникам:\n" + "\n".join(parts) + "\n"
-
     text = (
         f"🎮 <b>FragCounter — итоги смены</b>\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -259,9 +230,8 @@ async def send_report(operator_id: int, name: str, chat_id: int,
         f"✅ Закрыто заявок: <b>{stats['closed']}</b>\n"
         f"{resp_str}\n"
         f"{rate_str}\n"
-        f"{sources_str}"
         f"━━━━━━━━━━━━━━━\n"
-        f"GG WP! 🏆"
+        f"+100 social credit! 🏆"
     )
 
     async with httpx.AsyncClient(timeout=10) as client:
@@ -296,11 +266,6 @@ async def main():
 
     scheduler.start()
     log.info("Планировщик запущен")
-
-    log.info("=== ТЕСТОВЫЙ ЗАПУСК ===")
-    for op_id, (name, chat_id, sh_start, sh_end) in OPERATORS.items():
-        if chat_id is not None:
-            await send_report(op_id, name, chat_id, sh_start, sh_end)
 
     while True:
         await asyncio.sleep(60)
