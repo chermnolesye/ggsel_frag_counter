@@ -7,6 +7,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
 HDE_BASE = "https://ggsel.helpdeskeddy.com/api/v2"
 HDE_AUTH = ("jivo@ggsel.net", "26fc4db0-8683-4fe6-92b0-6e2daaae8a5c")
 TG_TOKEN = "8984090136:AAFjLjrT0iLoBBMCv2RLJlbtXs8Wdu5RJIA"
@@ -34,6 +37,7 @@ OPERATORS = {
     539: ("Иван С",     None,       2, 10),
     540: ("Иван М",     None,       2, 10),
 }
+# ============================================================
 
 ANSWER_EVENTS = {"ticket_answer", "ticket_answer_chat"}
 
@@ -108,10 +112,11 @@ async def check_ticket(client: httpx.AsyncClient, ticket: dict,
     events = list(r.json().get("data", {}).values())
     events.sort(key=lambda e: parse_hde_dt(e["date_created"]) or datetime.min)
 
-    op_assigned_at     = None
     op_answered        = False
     op_closed          = False
     first_op_answer_at = None
+    assigned_at        = None
+    op_name            = OPERATORS.get(operator_id, ("",))[0]
 
     for e in events:
         dt  = parse_hde_dt(e["date_created"])
@@ -121,8 +126,10 @@ async def check_ticket(client: httpx.AsyncClient, ticket: dict,
         if not dt or not (start <= dt <= end):
             continue
 
-        if evt == "owner_update" and uid == operator_id:
-            op_assigned_at = dt
+        if evt == "owner_update" and assigned_at is None:
+            text_ru = e.get("text", {}).get("ru", "")
+            if uid == operator_id or (uid == -2 and op_name and op_name in text_ru):
+                assigned_at = dt
 
         if evt in ANSWER_EVENTS and uid == operator_id:
             op_answered = True
@@ -132,12 +139,13 @@ async def check_ticket(client: httpx.AsyncClient, ticket: dict,
         if evt == "ticket_close" and uid == operator_id:
             op_closed = True
 
-    if not (op_assigned_at and op_answered and op_closed):
+    if not (op_answered and op_closed):
         return None
 
     response_seconds = None
-    if op_assigned_at and first_op_answer_at:
-        diff = (first_op_answer_at - op_assigned_at).total_seconds()
+    ref = assigned_at or first_op_answer_at
+    if ref and first_op_answer_at and first_op_answer_at >= ref:
+        diff = (first_op_answer_at - ref).total_seconds()
         if diff >= 0:
             response_seconds = diff
 
@@ -157,6 +165,7 @@ async def get_stats(operator_id: int, start: datetime, end: datetime) -> dict:
         candidates = await get_ticket_candidates(client, operator_id, start, end)
         log.info(f"  Кандидатов: {len(candidates)}")
 
+        # Проверяем аудит пачками по 10
         results = []
         for i in range(0, len(candidates), 10):
             batch = candidates[i:i+10]
@@ -166,6 +175,7 @@ async def get_stats(operator_id: int, start: datetime, end: datetime) -> dict:
             ])
             results.extend(batch_res)
 
+    # Дедупликация по ticket_id (заявка считается один раз за смену)
     seen = set()
     valid = []
     for r in results:
@@ -231,7 +241,7 @@ async def send_report(operator_id: int, name: str, chat_id: int,
         f"{resp_str}\n"
         f"{rate_str}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"+100 social credit! 🏆"
+        f"🏆 +100 social credit! 🏆"
     )
 
     async with httpx.AsyncClient(timeout=10) as client:
