@@ -3,6 +3,9 @@ import httpx
 import logging
 from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import pytz
+
+MSK = pytz.timezone("Europe/Moscow")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -44,7 +47,7 @@ ANSWER_EVENTS = {"ticket_answer", "ticket_answer_chat"}
 
 
 def shift_window(sh_start: int, sh_end: int) -> tuple[datetime, datetime]:
-    now = datetime.now()
+    now = datetime.now(MSK).replace(tzinfo=None)
     duration = sh_end - sh_start
     if duration <= 0:
         duration += 24
@@ -126,6 +129,7 @@ async def check_ticket(client: httpx.AsyncClient, ticket: dict,
         if not dt or not (start <= dt <= end):
             continue
 
+        # Назначение — вручную оператором или автоматом системой на него
         if evt == "owner_update" and assigned_at is None:
             text_ru = e.get("text", {}).get("ru", "")
             if uid == operator_id or (uid == -2 and op_name and op_name in text_ru):
@@ -142,10 +146,10 @@ async def check_ticket(client: httpx.AsyncClient, ticket: dict,
     if not (op_answered and op_closed):
         return None
 
+    # Время ответа: от назначения исполнителем до первого ответа
     response_seconds = None
-    ref = assigned_at or first_op_answer_at
-    if ref and first_op_answer_at and first_op_answer_at >= ref:
-        diff = (first_op_answer_at - ref).total_seconds()
+    if assigned_at and first_op_answer_at and first_op_answer_at >= assigned_at:
+        diff = (first_op_answer_at - assigned_at).total_seconds()
         if diff >= 0:
             response_seconds = diff
 
@@ -196,6 +200,9 @@ async def get_stats(operator_id: int, start: datetime, end: datetime) -> dict:
     rates = [r["rate"] for r in valid if r["rate"] is not None]
     avg_rate  = round(sum(rates) / len(rates), 1) if rates else None
     rate_count = len(rates)
+
+    times = [r["response_seconds"] for r in valid if r.get("response_seconds") is not None]
+    avg_response = round(sum(times) / len(times)) if times else None
 
     return {
         "closed":       closed,
