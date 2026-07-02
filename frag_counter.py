@@ -277,8 +277,15 @@ async def main():
     scheduler.start()
     log.info("Планировщик запущен")
 
+    # Разовый тест — удали после проверки
+    await send_report(369, "Александра", 907994201, 18, 2)
+
     while True:
         await asyncio.sleep(60)
 
+    
+
 if __name__ == "__main__":
     asyncio.run(main())
+  
+
