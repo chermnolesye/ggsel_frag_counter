@@ -109,6 +109,7 @@ async def check_ticket(client: httpx.AsyncClient, ticket: dict,
         r = await client.get(f"{HDE_BASE}/tickets/{ticket_id}/audit",
                              params={"page": page, "per_page": 100})
         if r.status_code != 200:
+            log.warning(f"  #{ticket_id}: аудит вернул {r.status_code}")
             return None
         data = r.json()
         page_events = list(data.get("data", {}).values())
@@ -147,7 +148,8 @@ async def check_ticket(client: httpx.AsyncClient, ticket: dict,
         if evt == "ticket_close" and uid == operator_id:
             op_closed = True
 
-    if not (op_answered and op_closed):
+    if not op_answered or not op_closed:
+        log.debug(f"  #{ticket_id}: отфильтрован — answered={op_answered} closed={op_closed}")
         return None
 
     response_seconds = None
@@ -182,8 +184,10 @@ async def get_stats(operator_id: int, start: datetime, end: datetime) -> dict:
 
     seen = set()
     valid = []
+    skipped = 0
     for r in results:
         if r is None:
+            skipped += 1
             continue
         if r["ticket_id"] in seen:
             continue
@@ -191,6 +195,7 @@ async def get_stats(operator_id: int, start: datetime, end: datetime) -> dict:
         valid.append(r)
 
     closed = len(valid)
+    log.info(f"  Засчитано: {closed}, отфильтровано: {skipped}")
 
     times = [r["response_seconds"] for r in valid if r["response_seconds"] is not None]
     avg_response = round(sum(times) / len(times)) if times else None
@@ -214,7 +219,7 @@ async def send_report(operator_id: int, name: str, chat_id: int,
         return
 
     start, end = shift_window(sh_start, sh_end)
-    log.info(f"Считаем {name}: {start.strftime('%H:%M')} — {end.strftime('%H:%M')}")
+    log.info(f"Считаем {name}: {start.strftime('%H:%M %d.%m')} — {end.strftime('%H:%M %d.%m')}")
 
     stats = await get_stats(operator_id, start, end)
 
@@ -283,9 +288,5 @@ async def main():
     while True:
         await asyncio.sleep(60)
 
-    
-
 if __name__ == "__main__":
     asyncio.run(main())
-  
-
