@@ -318,7 +318,8 @@ async def main():
     log.info("Планировщик запущен")
 
     # Разовый тест — удали после проверки
-    await send_report(369, "Александра", 907994201, 18, 2)
+    await send_report(100, "Мария", 456062447, 8, 16)
+
 
     while True:
         await asyncio.sleep(60)
