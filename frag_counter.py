@@ -18,7 +18,6 @@ HDE_AUTH = ("jivo@ggsel.net", "26fc4db0-8683-4fe6-92b0-6e2daaae8a5c")
 TG_TOKEN = "8984090136:AAFjLjrT0iLoBBMCv2RLJlbtXs8Wdu5RJIA"
 TG_URL   = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
-# HDE id -> (имя, telegram chat_id, час начала смены, час конца смены)
 OPERATORS = {
     # --- 08:00 - 16:00 ---
     153: ("Андрей",     None,       8, 16),
@@ -40,7 +39,6 @@ OPERATORS = {
     539: ("Иван С",     None,       2, 10),
     540: ("Иван М",     None,       2, 10),
 }
-# ============================================================
 
 ANSWER_EVENTS = {"ticket_answer", "ticket_answer_chat"}
 
@@ -102,14 +100,13 @@ async def check_ticket(client: httpx.AsyncClient, ticket: dict,
                        operator_id: int, start: datetime, end: datetime) -> dict | None:
     ticket_id = ticket["id"]
 
-    # Читаем ВСЕ страницы аудита
     events = []
     page = 1
     while True:
         r = await client.get(f"{HDE_BASE}/tickets/{ticket_id}/audit",
                              params={"page": page, "per_page": 100})
         if r.status_code != 200:
-            log.warning(f"  #{ticket_id}: аудит вернул {r.status_code}")
+            log.warning(f"  #{ticket_id}: аудит {r.status_code}")
             return None
         data = r.json()
         page_events = list(data.get("data", {}).values())
@@ -149,7 +146,8 @@ async def check_ticket(client: httpx.AsyncClient, ticket: dict,
             op_closed = True
 
     if not op_answered or not op_closed:
-        log.debug(f"  #{ticket_id}: отфильтрован — answered={op_answered} closed={op_closed}")
+        # Логируем причину отфильтровки
+        log.info(f"  SKIP #{ticket_id}: answered={op_answered} closed={op_closed}")
         return None
 
     response_seconds = None
@@ -184,10 +182,8 @@ async def get_stats(operator_id: int, start: datetime, end: datetime) -> dict:
 
     seen = set()
     valid = []
-    skipped = 0
     for r in results:
         if r is None:
-            skipped += 1
             continue
         if r["ticket_id"] in seen:
             continue
@@ -195,6 +191,7 @@ async def get_stats(operator_id: int, start: datetime, end: datetime) -> dict:
         valid.append(r)
 
     closed = len(valid)
+    skipped = len([r for r in results if r is None])
     log.info(f"  Засчитано: {closed}, отфильтровано: {skipped}")
 
     times = [r["response_seconds"] for r in valid if r["response_seconds"] is not None]
