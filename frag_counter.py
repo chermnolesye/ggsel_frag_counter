@@ -196,7 +196,15 @@ async def check_ticket(client: httpx.AsyncClient, ticket: dict,
             response_seconds = diff
 
     rate = ticket.get("rate")
-    rate_val = int(rate) if rate and str(rate).isdigit() else None
+    rate_date_str = ticket.get("rate_date", "")
+    rate_val = None
+    if rate and str(rate).isdigit() and rate_date_str:
+        try:
+            rate_dt = datetime.strptime(rate_date_str, "%Y-%m-%d %H:%M:%S")
+            if start <= rate_dt <= end:
+                rate_val = int(rate)
+        except Exception:
+            pass
 
     return {
         "ticket_id":        ticket_id,
@@ -316,10 +324,6 @@ async def main():
 
     scheduler.start()
     log.info("Планировщик запущен")
-
-    # Разовый тест — удали после проверки
-    await send_report(100, "Мария", 456062447, 8, 16)
-
 
     while True:
         await asyncio.sleep(60)
