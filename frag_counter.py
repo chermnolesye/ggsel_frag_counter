@@ -11,50 +11,39 @@ MSK = pytz.timezone("Europe/Moscow")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
-# ============================================================
-# НАСТРОЙКИ
-# ============================================================
 HDE_BASE = "https://ggsel.helpdeskeddy.com/api/v2"
 HDE_AUTH = ("jivo@ggsel.net", "26fc4db0-8683-4fe6-92b0-6e2daaae8a5c")
 TG_TOKEN = "8984090136:AAFjLjrT0iLoBBMCv2RLJlbtXs8Wdu5RJIA"
 TG_URL   = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
-# HDE id -> (имя, telegram chat_id, час начала смены, час конца смены)
 OPERATORS = {
-    # --- 08:00 - 16:00 ---
     153: ("Андрей",     None,       8, 16),
     301: ("Иван К",     None,       8, 16),
     535: ("Дмитрий",    None,       8, 16),
     100: ("Мария",      456062447,  8, 16),
-    # --- 14:00 - 22:00 ---
     536: ("Данила",     None,      14, 22),
     200: ("Диана",      None,      14, 22),
     62:  ("Игорь",      None,      14, 22),
     537: ("Виктор",     None,      14, 22),
     343: ("Роман",      None,      14, 22),
     538: ("Ксения",     None,      14, 22),
-    # --- 18:00 - 02:00 ---
     258: ("Максим",     None,      18,  2),
     391: ("Влада",      5203826927, 18,  2),
     369: ("Александра", 907994201, 18,  2),
-    # --- 02:00 - 10:00 ---
     539: ("Иван С",     None,       2, 10),
     540: ("Иван М",     None,       2, 10),
 }
-# ============================================================
 
 ANSWER_EVENTS = {"ticket_answer", "ticket_answer_chat"}
 
 
 class RateLimiter:
-    """Не даёт превысить max_per_minute запросов в минуту."""
     def __init__(self, max_per_minute: int = 180):
         self.max_per_minute = max_per_minute
         self._timestamps: list[float] = []
 
     async def wait(self):
         now = time.monotonic()
-        # Убираем запросы старше 60 секунд
         self._timestamps = [t for t in self._timestamps if now - t < 60]
         if len(self._timestamps) >= self.max_per_minute:
             wait_for = 60 - (now - self._timestamps[0]) + 0.2
@@ -81,6 +70,13 @@ def parse_hde_dt(s: str) -> datetime | None:
     except Exception:
         return None
 
+def parse_dt(s: str) -> datetime | None:
+    """Парсит дату в формате YYYY-MM-DD HH:MM:SS (из тела заявки)."""
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
 def format_time(seconds: int) -> str:
     if seconds < 60:
         return f"{seconds} сек"
@@ -93,20 +89,24 @@ def format_time(seconds: int) -> str:
 
 
 async def hde_get(client: httpx.AsyncClient, url: str,
-                  params: dict = None, retries: int = 3) -> dict | None:
-    """GET с rate limiting и retry при 429."""
+                  params: dict = None, retries: int = 4) -> dict | None:
     for attempt in range(retries):
-        await LIMITER.wait()
-        r = await client.get(url, params=params)
-        if r.status_code == 200:
-            return r.json()
-        if r.status_code == 429:
-            wait = 25 * (attempt + 1)
-            log.warning(f"429 — ждём {wait}с (попытка {attempt+1}/{retries})")
+        try:
+            await LIMITER.wait()
+            r = await client.get(url, params=params)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429:
+                wait = 25 * (attempt + 1)
+                log.warning(f"429 — ждём {wait}с (попытка {attempt+1}/{retries})")
+                await asyncio.sleep(wait)
+                continue
+            log.error(f"HTTP {r.status_code}: {r.text[:100]}")
+            return None
+        except Exception as e:
+            wait = 5 * (attempt + 1)
+            log.warning(f"Ошибка соединения ({e.__class__.__name__}), retry через {wait}с")
             await asyncio.sleep(wait)
-            continue
-        log.error(f"HTTP {r.status_code}: {r.text[:100]}")
-        return None
     log.error(f"Все попытки исчерпаны: {url}")
     return None
 
@@ -195,16 +195,14 @@ async def check_ticket(client: httpx.AsyncClient, ticket: dict,
         if diff >= 0:
             response_seconds = diff
 
+    # Оценка только если rate_date попадает в период смены
+    rate_val = None
     rate = ticket.get("rate")
     rate_date_str = ticket.get("rate_date", "")
-    rate_val = None
     if rate and str(rate).isdigit() and rate_date_str:
-        try:
-            rate_dt = datetime.strptime(rate_date_str, "%Y-%m-%d %H:%M:%S")
-            if start <= rate_dt <= end:
-                rate_val = int(rate)
-        except Exception:
-            pass
+        rate_dt = parse_dt(rate_date_str)
+        if rate_dt and start <= rate_dt <= end:
+            rate_val = int(rate)
 
     return {
         "ticket_id":        ticket_id,
@@ -219,7 +217,6 @@ async def get_stats(operator_id: int, start: datetime, end: datetime) -> dict:
         log.info(f"  Кандидатов: {len(candidates)}")
 
         results = []
-        # Пачки по 5 параллельно, между пачками пауза
         for i in range(0, len(candidates), 5):
             batch = candidates[i:i+5]
             batch_res = await asyncio.gather(*[
@@ -307,7 +304,6 @@ async def send_report(operator_id: int, name: str, chat_id: int,
 
 
 async def run_shift(end_hour: int):
-    # Последовательно чтобы не превышать лимит API
     for op_id, (name, chat_id, sh_start, sh_end) in OPERATORS.items():
         if sh_end == end_hour:
             await send_report(op_id, name, chat_id, sh_start, sh_end)
@@ -324,6 +320,17 @@ async def main():
 
     scheduler.start()
     log.info("Планировщик запущен")
+
+    # Разовый тест — удали после проверки
+    async def delayed_test():
+        now = datetime.now(MSK).replace(tzinfo=None)
+        target = now.replace(hour=3, minute=0, second=0, microsecond=0)
+        wait_sec = (target - now).total_seconds()
+        if wait_sec > 0:
+            await asyncio.sleep(wait_sec)
+        await send_report(391, "Влада", 5203826927, 18, 3)
+        await send_report(369, "Александра", 907994201, 18, 3)
+    asyncio.create_task(delayed_test())
 
     while True:
         await asyncio.sleep(60)
