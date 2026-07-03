@@ -1,6 +1,7 @@
 import asyncio
 import httpx
 import logging
+import time
 from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import pytz
@@ -18,6 +19,7 @@ HDE_AUTH = ("jivo@ggsel.net", "26fc4db0-8683-4fe6-92b0-6e2daaae8a5c")
 TG_TOKEN = "8984090136:AAFjLjrT0iLoBBMCv2RLJlbtXs8Wdu5RJIA"
 TG_URL   = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
+# HDE id -> (имя, telegram chat_id, час начала смены, час конца смены)
 OPERATORS = {
     # --- 08:00 - 16:00 ---
     153: ("Андрей",     None,       8, 16),
@@ -39,8 +41,31 @@ OPERATORS = {
     539: ("Иван С",     None,       2, 10),
     540: ("Иван М",     None,       2, 10),
 }
+# ============================================================
 
 ANSWER_EVENTS = {"ticket_answer", "ticket_answer_chat"}
+
+
+class RateLimiter:
+    """Не даёт превысить max_per_minute запросов в минуту."""
+    def __init__(self, max_per_minute: int = 180):
+        self.max_per_minute = max_per_minute
+        self._timestamps: list[float] = []
+
+    async def wait(self):
+        now = time.monotonic()
+        # Убираем запросы старше 60 секунд
+        self._timestamps = [t for t in self._timestamps if now - t < 60]
+        if len(self._timestamps) >= self.max_per_minute:
+            wait_for = 60 - (now - self._timestamps[0]) + 0.2
+            if wait_for > 0:
+                log.info(f"Rate limiter: пауза {wait_for:.1f}с")
+                await asyncio.sleep(wait_for)
+            self._timestamps = [t for t in self._timestamps if time.monotonic() - t < 60]
+        self._timestamps.append(time.monotonic())
+
+
+LIMITER = RateLimiter(max_per_minute=180)
 
 
 def shift_window(sh_start: int, sh_end: int) -> tuple[datetime, datetime]:
@@ -67,13 +92,32 @@ def format_time(seconds: int) -> str:
         return f"{h}ч {m}мин" if m else f"{h}ч"
 
 
+async def hde_get(client: httpx.AsyncClient, url: str,
+                  params: dict = None, retries: int = 3) -> dict | None:
+    """GET с rate limiting и retry при 429."""
+    for attempt in range(retries):
+        await LIMITER.wait()
+        r = await client.get(url, params=params)
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code == 429:
+            wait = 25 * (attempt + 1)
+            log.warning(f"429 — ждём {wait}с (попытка {attempt+1}/{retries})")
+            await asyncio.sleep(wait)
+            continue
+        log.error(f"HTTP {r.status_code}: {r.text[:100]}")
+        return None
+    log.error(f"Все попытки исчерпаны: {url}")
+    return None
+
+
 async def get_ticket_candidates(client: httpx.AsyncClient, operator_id: int,
                                 start: datetime, end: datetime) -> list[dict]:
     fmt = "%Y-%m-%d %H:%M:%S"
     tickets = []
     page = 1
     while True:
-        r = await client.get(f"{HDE_BASE}/tickets", params={
+        data = await hde_get(client, f"{HDE_BASE}/tickets", params={
             "owner_list":        operator_id,
             "status_list":       "closed",
             "from_date_updated": start.strftime(fmt),
@@ -81,10 +125,8 @@ async def get_ticket_candidates(client: httpx.AsyncClient, operator_id: int,
             "per_page":          100,
             "page":              page,
         })
-        if r.status_code != 200:
-            log.error(f"tickets {r.status_code}: {r.text[:100]}")
+        if not data:
             break
-        data = r.json()
         items = data.get("data", {})
         if isinstance(items, dict):
             items = list(items.values())
@@ -103,12 +145,10 @@ async def check_ticket(client: httpx.AsyncClient, ticket: dict,
     events = []
     page = 1
     while True:
-        r = await client.get(f"{HDE_BASE}/tickets/{ticket_id}/audit",
+        data = await hde_get(client, f"{HDE_BASE}/tickets/{ticket_id}/audit",
                              params={"page": page, "per_page": 100})
-        if r.status_code != 200:
-            log.warning(f"  #{ticket_id}: аудит {r.status_code}")
+        if not data:
             return None
-        data = r.json()
         page_events = list(data.get("data", {}).values())
         events.extend(page_events)
         pag = data.get("pagination", {})
@@ -145,8 +185,7 @@ async def check_ticket(client: httpx.AsyncClient, ticket: dict,
         if evt == "ticket_close" and uid == operator_id:
             op_closed = True
 
-    if not op_answered or not op_closed:
-        # Логируем причину отфильтровки
+    if not op_answered:
         log.info(f"  SKIP #{ticket_id}: answered={op_answered} closed={op_closed}")
         return None
 
@@ -167,13 +206,14 @@ async def check_ticket(client: httpx.AsyncClient, ticket: dict,
 
 
 async def get_stats(operator_id: int, start: datetime, end: datetime) -> dict:
-    async with httpx.AsyncClient(auth=HDE_AUTH, timeout=30) as client:
+    async with httpx.AsyncClient(auth=HDE_AUTH, timeout=60) as client:
         candidates = await get_ticket_candidates(client, operator_id, start, end)
         log.info(f"  Кандидатов: {len(candidates)}")
 
         results = []
-        for i in range(0, len(candidates), 10):
-            batch = candidates[i:i+10]
+        # Пачки по 5 параллельно, между пачками пауза
+        for i in range(0, len(candidates), 5):
+            batch = candidates[i:i+5]
             batch_res = await asyncio.gather(*[
                 check_ticket(client, t, operator_id, start, end)
                 for t in batch
@@ -259,12 +299,10 @@ async def send_report(operator_id: int, name: str, chat_id: int,
 
 
 async def run_shift(end_hour: int):
-    tasks = [
-        send_report(op_id, name, chat_id, sh_start, sh_end)
-        for op_id, (name, chat_id, sh_start, sh_end) in OPERATORS.items()
-        if sh_end == end_hour
-    ]
-    await asyncio.gather(*tasks)
+    # Последовательно чтобы не превышать лимит API
+    for op_id, (name, chat_id, sh_start, sh_end) in OPERATORS.items():
+        if sh_end == end_hour:
+            await send_report(op_id, name, chat_id, sh_start, sh_end)
 
 
 async def main():
